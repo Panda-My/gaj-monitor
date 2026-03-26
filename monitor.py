@@ -13,7 +13,7 @@ from playwright.sync_api import sync_playwright
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://gaj.bozhou.gov.cn/News/showList/6932/"
-PAGES = 5
+PAGES = 1                     # 只抓取第一页（最新20条）
 RECORD_FILE = "record.json"
 
 DINGTALK_WEBHOOK = os.environ.get("DINGTALK_WEBHOOK")
@@ -55,63 +55,44 @@ def load_records():
 
 def save_records(records):
     records.sort(key=lambda x: x.get('date', ''), reverse=True)
-    records = records[:100]
+    records = records[:100]   # 保留最新100条，可根据需要调整
     with open(RECORD_FILE, 'w', encoding='utf-8') as f:
         json.dump(records, f, ensure_ascii=False, indent=2)
 
 def fetch_articles_from_page(page_num):
+    """使用 Playwright Firefox 抓取单页文章"""
     url = BASE_URL + f"page_{page_num}.html"
     print(f"[{datetime.now()}] 正在抓取 {url}")
     with sync_playwright() as p:
-        # 启动浏览器，添加隐藏无头特征的参数
-        browser = p.firefox.launch(
-            headless=True,
-            args=[
-                "--disable-blink-features=AutomationControlled",
-                "--disable-features=IsolateOrigins,site-per-process",
-            ]
-        )
+        browser = p.firefox.launch(headless=True)
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0",
-            viewport={"width": 1280, "height": 800},
-            extra_http_headers={
-                "Accept-Language": "zh-CN,zh;q=0.9",
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            }
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0"
         )
         page = context.new_page()
-        # 添加一个简单的脚本，隐藏 webdriver 属性
-        page.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', {
-                get: () => undefined
-            });
-        """)
-        response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        page.set_viewport_size({"width": 1280, "height": 800})
+        response = page.goto(url, wait_until="networkidle", timeout=30000)
         if not response or not response.ok:
             print(f"页面访问失败，状态码: {response.status if response else '无响应'}")
             return []
 
-        # 等待列表容器出现（使用更具体的选择器）
         try:
-            page.wait_for_selector(".m-cglist ul", timeout=30000)
+            page.wait_for_selector("ul", timeout=30000)
+            page.wait_for_timeout(2000)
         except Exception as e:
-            print(f"等待列表超时，页面内容片段：{page.content()[:500]}")
+            print(f"等待 ul 超时，页面内容片段：{page.content()[:500]}")
             return []
 
-        # 额外等待 2 秒确保渲染完成
-        page.wait_for_timeout(2000)
         html = page.content()
         browser.close()
 
     soup = BeautifulSoup(html, 'html.parser')
-    # 查找包含公告列表的容器
-    container = soup.select_one(".m-cglist ul")
-    if not container:
-        print(f"第{page_num}页未找到列表容器")
+    ul = soup.find('ul')
+    if not ul:
+        print(f"第{page_num}页未找到 ul 列表容器")
         return []
 
     articles = []
-    for item in container.find_all('li'):
+    for item in ul.find_all('li'):
         a_tag = item.find('a')
         span_tag = item.find('span')
         if not a_tag:
@@ -140,6 +121,7 @@ def fetch_all_articles():
         if page_articles:
             all_articles.extend(page_articles)
         time.sleep(2)
+    # 去重
     seen = set()
     unique = []
     for art in all_articles:
