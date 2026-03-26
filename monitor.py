@@ -14,30 +14,24 @@ from bs4 import BeautifulSoup
 
 # ==================== 配置 ====================
 BASE_URL = "https://gaj.bozhou.gov.cn/News/showList/6932/"
-PAGES = 5                     # 抓取前5页
+PAGES = 5
 RECORD_FILE = "record.json"
 
-# 从环境变量读取钉钉配置（由 GitHub Actions 注入）
 DINGTALK_WEBHOOK = os.environ.get("DINGTALK_WEBHOOK")
-DINGTALK_SECRET = os.environ.get("DINGTALK_SECRET")   # 加签密钥
+DINGTALK_SECRET = os.environ.get("DINGTALK_SECRET")
 if not DINGTALK_WEBHOOK:
     raise RuntimeError("DINGTALK_WEBHOOK environment variable not set")
 # =============================================
 
 def sign_dingtalk(secret, timestamp):
-    """钉钉加签"""
     string_to_sign = f"{timestamp}\n{secret}"
     hmac_code = hmac.new(secret.encode(), string_to_sign.encode(), digestmod=hashlib.sha256).digest()
     sign = urllib.parse.quote_plus(base64.b64encode(hmac_code))
     return sign
 
 def send_dingtalk_message(content):
-    """发送钉钉消息（支持加签）"""
     headers = {"Content-Type": "application/json"}
-    data = {
-        "msgtype": "text",
-        "text": {"content": content}
-    }
+    data = {"msgtype": "text", "text": {"content": content}}
     url = DINGTALK_WEBHOOK
     if DINGTALK_SECRET:
         timestamp = str(round(time.time() * 1000))
@@ -68,13 +62,32 @@ def save_records(records):
         json.dump(records, f, ensure_ascii=False, indent=2)
 
 def fetch_articles_from_page(page_num):
-    """使用 Playwright 抓取单页文章"""
+    """使用 Playwright 抓取单页文章，增强等待和调试"""
     url = BASE_URL + f"page_{page_num}.html"
+    print(f"[{datetime.now()}] 正在抓取 {url}")
     with sync_playwright() as p:
-        browser = p.firefox.launch(headless=True)
-        page = browser.new_page()
-        page.goto(url, wait_until="networkidle")
-        page.wait_for_selector("ul", timeout=10000)
+        # 使用 Chromium，兼容性更好；添加真实 UA
+        browser = p.chromium.launch(headless=True)
+        context = browser.new_context(
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+        )
+        page = context.new_page()
+        # 设置视口大小，避免因响应式布局导致元素不可见
+        page.set_viewport_size({"width": 1280, "height": 800})
+        # 访问页面，等待网络空闲（最多 30 秒）
+        response = page.goto(url, wait_until="networkidle", timeout=30000)
+        if not response or not response.ok:
+            print(f"页面访问失败，状态码: {response.status if response else '无响应'}")
+            return []
+
+        # 等待列表容器出现（最长 30 秒）
+        try:
+            page.wait_for_selector("ul", timeout=30000)
+        except Exception as e:
+            # 如果超时，打印当前页面源码片段，帮助调试
+            print(f"等待 ul 超时，页面内容片段：{page.content()[:500]}")
+            return []
+
         html = page.content()
         browser.close()
 
@@ -104,6 +117,7 @@ def fetch_articles_from_page(page_num):
             "link": link,
             "date": date
         })
+    print(f"第{page_num}页抓到 {len(articles)} 条公告")
     return articles
 
 def fetch_all_articles():
@@ -112,7 +126,7 @@ def fetch_all_articles():
         page_articles = fetch_articles_from_page(i)
         if page_articles:
             all_articles.extend(page_articles)
-        time.sleep(1)   # 礼貌延迟
+        time.sleep(2)  # 增加页面间隔，避免请求过快
     # 去重
     seen = set()
     unique = []
@@ -143,7 +157,6 @@ def main():
             send_dingtalk_message(msg)
             time.sleep(1)
 
-        # 合并记录并保留最新100条
         all_records = existing + new_articles
         all_records.sort(key=lambda x: x.get('date', ''), reverse=True)
         all_records = all_records[:100]
