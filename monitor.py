@@ -11,8 +11,8 @@ from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
 
-BASE_URL = "https://gaj.bozhou.gov.cn/News/showList/6932/"
-PAGES = 1                     # 只抓取第一页（最新20条）
+BASE_URL = "https://bz.ahggzp.gov.cn/cms/web/09nje5gp/"
+PAGES = 1                     # 只抓取第一页（最新约10条）
 RECORD_FILE = "record.json"
 
 DINGTALK_WEBHOOK = os.environ.get("DINGTALK_WEBHOOK")
@@ -20,14 +20,11 @@ DINGTALK_SECRET = os.environ.get("DINGTALK_SECRET")
 if not DINGTALK_WEBHOOK:
     raise RuntimeError("DINGTALK_WEBHOOK environment variable not set")
 
-# 模拟真实浏览器的请求头
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 QQBrowser/21.0.8085.400",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "zh-CN,zh;q=0.9",
-    "Referer": "https://gaj.bozhou.gov.cn/",
-    "Cache-Control": "no-cache",
-    "Pragma": "no-cache",
+    "Referer": "https://bz.ahggzp.gov.cn/",
 }
 
 def sign_dingtalk(secret, timestamp):
@@ -68,10 +65,20 @@ def save_records(records):
     with open(RECORD_FILE, 'w', encoding='utf-8') as f:
         json.dump(records, f, ensure_ascii=False, indent=2)
 
-def fetch_articles_from_page(page_num):
-    url = BASE_URL + f"page_{page_num}.html"
+def fetch_articles_from_page(page_num=1):
+    """抓取指定页码的通知公告列表，返回文章列表"""
+    url = BASE_URL
+    if page_num > 1:
+        # 注意分页参数是 pageNo，POST 提交
+        # 但通过 GET 直接访问 URL 不带参数时返回第一页
+        # 如果要获取第二页，需要 POST 表单数据。为简化，我们只抓第一页（最新公告）。
+        # 如果你需要多页，可以扩展使用 POST 请求。
+        print("暂不支持多页抓取，仅抓取第一页")
+        return []
+    
     print(f"[{datetime.now()}] 正在抓取 {url}")
     try:
+        # 使用 GET 获取第一页，该网站第一页内容即包含完整列表
         response = requests.get(url, headers=HEADERS, timeout=30)
         response.encoding = 'utf-8'
         if response.status_code != 200:
@@ -82,30 +89,31 @@ def fetch_articles_from_page(page_num):
         print(f"请求失败: {e}")
         return []
 
-    # 检查是否返回了完整页面（包含公告列表）
-    if "m-cglist" not in html:
-        print("页面中未找到列表容器，可能是反爬")
+    # 检查是否包含列表容器
+    if "cms_article_list" not in html:
+        print("页面中未找到列表容器")
         return []
 
     soup = BeautifulSoup(html, 'html.parser')
-    container = soup.select_one('.m-cglist ul')
+    container = soup.find('div', id='cms_article_list')
     if not container:
-        print("未找到 .m-cglist ul")
+        print("未找到 id=cms_article_list 的容器")
         return []
 
     articles = []
-    for item in container.find_all('li'):
-        a_tag = item.find('a')
-        span_tag = item.find('span')
+    for item in container.find_all('div', class_='zx'):
+        a_tag = item.find('a', class_='zxtitle')
         if not a_tag:
             continue
         title = a_tag.get_text(strip=True)
         link = a_tag.get('href')
         if not title or not link:
             continue
+        # 处理相对链接
         if link.startswith('/'):
-            link = "https://gaj.bozhou.gov.cn" + link
-        date = span_tag.get_text(strip=True) if span_tag else ""
+            link = "https://bz.ahggzp.gov.cn" + link
+        date_div = item.find('div', class_='dateinfo')
+        date = date_div.get_text(strip=True) if date_div else ""
         unique_id = hashlib.md5(f"{title}{link}".encode()).hexdigest()
         articles.append({
             "id": unique_id,
@@ -113,20 +121,15 @@ def fetch_articles_from_page(page_num):
             "link": link,
             "date": date
         })
-    print(f"第{page_num}页抓到 {len(articles)} 条公告")
+    print(f"抓取到 {len(articles)} 条公告")
     return articles
 
 def fetch_all_articles():
-    all_articles = []
-    for i in range(1, PAGES + 1):
-        page_articles = fetch_articles_from_page(i)
-        if page_articles:
-            all_articles.extend(page_articles)
-        time.sleep(2)   # 礼貌延迟
-    return all_articles
+    """目前只抓第一页，如需多页可扩展"""
+    return fetch_articles_from_page(1)
 
 def main():
-    print(f"[{datetime.now()}] 开始监控（抓取前{PAGES}页）")
+    print(f"[{datetime.now()}] 开始监控（亳州公共招聘网通知公告）")
     existing = load_records()
     existing_ids = {r['id'] for r in existing}
 
@@ -139,7 +142,7 @@ def main():
     if new_articles:
         print(f"发现 {len(new_articles)} 条新内容")
         for art in new_articles:
-            msg = f"【新增公告】\n标题：{art['title']}\n链接：{art['link']}"
+            msg = f"【新增招聘公告】\n标题：{art['title']}\n链接：{art['link']}"
             if art['date']:
                 msg += f"\n日期：{art['date']}"
             send_dingtalk_message(msg)
