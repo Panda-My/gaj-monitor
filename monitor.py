@@ -62,19 +62,18 @@ def save_records(records):
         json.dump(records, f, ensure_ascii=False, indent=2)
 
 def fetch_articles_from_page(page_num):
-    """使用 Playwright 抓取单页文章，增强等待和调试"""
+    """使用 Playwright Firefox 抓取单页文章"""
     url = BASE_URL + f"page_{page_num}.html"
     print(f"[{datetime.now()}] 正在抓取 {url}")
     with sync_playwright() as p:
-        # 使用 Chromium，兼容性更好；添加真实 UA
-        browser = p.chromium.launch(headless=True)
+        # 使用 firefox（工作流中已安装）
+        browser = p.firefox.launch(headless=True)
         context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0"
         )
         page = context.new_page()
-        # 设置视口大小，避免因响应式布局导致元素不可见
         page.set_viewport_size({"width": 1280, "height": 800})
-        # 访问页面，等待网络空闲（最多 30 秒）
+        # 访问页面，等待网络空闲（最长 30 秒）
         response = page.goto(url, wait_until="networkidle", timeout=30000)
         if not response or not response.ok:
             print(f"页面访问失败，状态码: {response.status if response else '无响应'}")
@@ -82,9 +81,11 @@ def fetch_articles_from_page(page_num):
 
         # 等待列表容器出现（最长 30 秒）
         try:
+            # 等待 ul 元素出现，并确保其内容不为空
             page.wait_for_selector("ul", timeout=30000)
+            # 额外等待一小段时间，确保动态内容填充完毕
+            page.wait_for_timeout(2000)
         except Exception as e:
-            # 如果超时，打印当前页面源码片段，帮助调试
             print(f"等待 ul 超时，页面内容片段：{page.content()[:500]}")
             return []
 
@@ -126,7 +127,7 @@ def fetch_all_articles():
         page_articles = fetch_articles_from_page(i)
         if page_articles:
             all_articles.extend(page_articles)
-        time.sleep(2)  # 增加页面间隔，避免请求过快
+        time.sleep(2)  # 页面间隔
     # 去重
     seen = set()
     unique = []
