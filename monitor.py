@@ -7,22 +7,28 @@ import time
 import hmac
 import base64
 import urllib.parse
-import random
 from datetime import datetime
 import requests
-from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://gaj.bozhou.gov.cn/News/showList/6932/"
 PAGES = 1                     # 只抓取第一页（最新20条）
 RECORD_FILE = "record.json"
-MAX_RETRIES = 3               # 每页最多重试3次
-RETRY_DELAY = 5               # 重试等待秒数
 
 DINGTALK_WEBHOOK = os.environ.get("DINGTALK_WEBHOOK")
 DINGTALK_SECRET = os.environ.get("DINGTALK_SECRET")
 if not DINGTALK_WEBHOOK:
     raise RuntimeError("DINGTALK_WEBHOOK environment variable not set")
+
+# 模拟真实浏览器的请求头
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 QQBrowser/21.0.8085.400",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+    "Referer": "https://gaj.bozhou.gov.cn/",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
+}
 
 def sign_dingtalk(secret, timestamp):
     string_to_sign = f"{timestamp}\n{secret}"
@@ -63,93 +69,52 @@ def save_records(records):
         json.dump(records, f, ensure_ascii=False, indent=2)
 
 def fetch_articles_from_page(page_num):
-    """带重试的抓取函数"""
     url = BASE_URL + f"page_{page_num}.html"
-    for attempt in range(1, MAX_RETRIES + 1):
-        print(f"[{datetime.now()}] 尝试 {attempt}/{MAX_RETRIES} 抓取 {url}")
-        try:
-            with sync_playwright() as p:
-                # 使用 firefox，增加更真实的浏览器特征
-                browser = p.firefox.launch(headless=True)
-                context = browser.new_context(
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:115.0) Gecko/20100101 Firefox/115.0",
-                    viewport={"width": 1920, "height": 1080},
-                    locale="zh-CN",
-                    timezone_id="Asia/Shanghai",
-                    extra_http_headers={
-                        "Accept-Language": "zh-CN,zh;q=0.9",
-                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                    }
-                )
-                page = context.new_page()
-                # 添加随机延迟，模拟人类行为
-                time.sleep(random.uniform(1, 3))
-                response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                if not response or not response.ok:
-                    print(f"页面访问失败，状态码: {response.status if response else '无响应'}")
-                    continue
+    print(f"[{datetime.now()}] 正在抓取 {url}")
+    try:
+        response = requests.get(url, headers=HEADERS, timeout=30)
+        response.encoding = 'utf-8'
+        if response.status_code != 200:
+            print(f"HTTP {response.status_code} 错误")
+            return []
+        html = response.text
+    except Exception as e:
+        print(f"请求失败: {e}")
+        return []
 
-                # 等待页面中必要的元素出现（可能是 ul 或 .m-cglist）
-                try:
-                    # 优先等待 ul 元素
-                    page.wait_for_selector("ul", timeout=20000)
-                except PlaywrightTimeoutError:
-                    # 如果 ul 超时，尝试等待 .m-cglist 容器
-                    try:
-                        page.wait_for_selector(".m-cglist", timeout=10000)
-                    except PlaywrightTimeoutError:
-                        print(f"等待列表容器超时，页面内容片段：{page.content()[:500]}")
-                        # 如果仍然超时，则重试
-                        continue
+    # 检查是否返回了完整页面（包含公告列表）
+    if "m-cglist" not in html:
+        print("页面中未找到列表容器，可能是反爬")
+        return []
 
-                # 额外等待动态内容填充
-                page.wait_for_timeout(2000)
-                html = page.content()
-                browser.close()
+    soup = BeautifulSoup(html, 'html.parser')
+    container = soup.select_one('.m-cglist ul')
+    if not container:
+        print("未找到 .m-cglist ul")
+        return []
 
-            soup = BeautifulSoup(html, 'html.parser')
-            # 尝试多种选择器
-            ul = soup.find('ul')
-            if not ul:
-                # 尝试找 class 包含 cglist 的容器
-                ul = soup.select_one('.m-cglist ul')
-            if not ul:
-                print(f"第{page_num}页未找到列表容器")
-                continue
-
-            articles = []
-            for item in ul.find_all('li'):
-                a_tag = item.find('a')
-                span_tag = item.find('span')
-                if not a_tag:
-                    continue
-                title = a_tag.get_text(strip=True)
-                link = a_tag.get('href')
-                if not title or not link:
-                    continue
-                if link.startswith('/'):
-                    link = "https://gaj.bozhou.gov.cn" + link
-                date = span_tag.get_text(strip=True) if span_tag else ""
-                unique_id = hashlib.md5(f"{title}{link}".encode()).hexdigest()
-                articles.append({
-                    "id": unique_id,
-                    "title": title,
-                    "link": link,
-                    "date": date
-                })
-            print(f"第{page_num}页抓到 {len(articles)} 条公告")
-            return articles
-
-        except Exception as e:
-            print(f"抓取过程中出现异常: {e}")
-            if attempt < MAX_RETRIES:
-                print(f"等待 {RETRY_DELAY} 秒后重试...")
-                time.sleep(RETRY_DELAY)
-            else:
-                print("已达到最大重试次数，放弃抓取")
-                return []
-
-    return []
+    articles = []
+    for item in container.find_all('li'):
+        a_tag = item.find('a')
+        span_tag = item.find('span')
+        if not a_tag:
+            continue
+        title = a_tag.get_text(strip=True)
+        link = a_tag.get('href')
+        if not title or not link:
+            continue
+        if link.startswith('/'):
+            link = "https://gaj.bozhou.gov.cn" + link
+        date = span_tag.get_text(strip=True) if span_tag else ""
+        unique_id = hashlib.md5(f"{title}{link}".encode()).hexdigest()
+        articles.append({
+            "id": unique_id,
+            "title": title,
+            "link": link,
+            "date": date
+        })
+    print(f"第{page_num}页抓到 {len(articles)} 条公告")
+    return articles
 
 def fetch_all_articles():
     all_articles = []
@@ -157,16 +122,8 @@ def fetch_all_articles():
         page_articles = fetch_articles_from_page(i)
         if page_articles:
             all_articles.extend(page_articles)
-        time.sleep(random.uniform(3, 5))  # 随机延迟
-    # 去重
-    seen = set()
-    unique = []
-    for art in all_articles:
-        if art['id'] not in seen:
-            seen.add(art['id'])
-            unique.append(art)
-    unique.sort(key=lambda x: x.get('date', ''), reverse=True)
-    return unique
+        time.sleep(2)   # 礼貌延迟
+    return all_articles
 
 def main():
     print(f"[{datetime.now()}] 开始监控（抓取前{PAGES}页）")
