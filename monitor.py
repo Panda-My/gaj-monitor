@@ -7,14 +7,17 @@ import time
 import hmac
 import base64
 import urllib.parse
+import random
 from datetime import datetime
 import requests
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 from bs4 import BeautifulSoup
 
 BASE_URL = "https://gaj.bozhou.gov.cn/News/showList/6932/"
 PAGES = 1                     # 只抓取第一页（最新20条）
 RECORD_FILE = "record.json"
+MAX_RETRIES = 3               # 每页最多重试3次
+RETRY_DELAY = 5               # 重试等待秒数
 
 DINGTALK_WEBHOOK = os.environ.get("DINGTALK_WEBHOOK")
 DINGTALK_SECRET = os.environ.get("DINGTALK_SECRET")
@@ -55,64 +58,98 @@ def load_records():
 
 def save_records(records):
     records.sort(key=lambda x: x.get('date', ''), reverse=True)
-    records = records[:100]   # 保留最新100条，可根据需要调整
+    records = records[:100]
     with open(RECORD_FILE, 'w', encoding='utf-8') as f:
         json.dump(records, f, ensure_ascii=False, indent=2)
 
 def fetch_articles_from_page(page_num):
-    """使用 Playwright Firefox 抓取单页文章"""
+    """带重试的抓取函数"""
     url = BASE_URL + f"page_{page_num}.html"
-    print(f"[{datetime.now()}] 正在抓取 {url}")
-    with sync_playwright() as p:
-        browser = p.firefox.launch(headless=True)
-        context = browser.new_context(
-            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:109.0) Gecko/20100101 Firefox/115.0"
-        )
-        page = context.new_page()
-        page.set_viewport_size({"width": 1280, "height": 800})
-        response = page.goto(url, wait_until="networkidle", timeout=30000)
-        if not response or not response.ok:
-            print(f"页面访问失败，状态码: {response.status if response else '无响应'}")
-            return []
-
+    for attempt in range(1, MAX_RETRIES + 1):
+        print(f"[{datetime.now()}] 尝试 {attempt}/{MAX_RETRIES} 抓取 {url}")
         try:
-            page.wait_for_selector("ul", timeout=30000)
-            page.wait_for_timeout(2000)
+            with sync_playwright() as p:
+                # 使用 firefox，增加更真实的浏览器特征
+                browser = p.firefox.launch(headless=True)
+                context = browser.new_context(
+                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:115.0) Gecko/20100101 Firefox/115.0",
+                    viewport={"width": 1920, "height": 1080},
+                    locale="zh-CN",
+                    timezone_id="Asia/Shanghai",
+                    extra_http_headers={
+                        "Accept-Language": "zh-CN,zh;q=0.9",
+                        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                    }
+                )
+                page = context.new_page()
+                # 添加随机延迟，模拟人类行为
+                time.sleep(random.uniform(1, 3))
+                response = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                if not response or not response.ok:
+                    print(f"页面访问失败，状态码: {response.status if response else '无响应'}")
+                    continue
+
+                # 等待页面中必要的元素出现（可能是 ul 或 .m-cglist）
+                try:
+                    # 优先等待 ul 元素
+                    page.wait_for_selector("ul", timeout=20000)
+                except PlaywrightTimeoutError:
+                    # 如果 ul 超时，尝试等待 .m-cglist 容器
+                    try:
+                        page.wait_for_selector(".m-cglist", timeout=10000)
+                    except PlaywrightTimeoutError:
+                        print(f"等待列表容器超时，页面内容片段：{page.content()[:500]}")
+                        # 如果仍然超时，则重试
+                        continue
+
+                # 额外等待动态内容填充
+                page.wait_for_timeout(2000)
+                html = page.content()
+                browser.close()
+
+            soup = BeautifulSoup(html, 'html.parser')
+            # 尝试多种选择器
+            ul = soup.find('ul')
+            if not ul:
+                # 尝试找 class 包含 cglist 的容器
+                ul = soup.select_one('.m-cglist ul')
+            if not ul:
+                print(f"第{page_num}页未找到列表容器")
+                continue
+
+            articles = []
+            for item in ul.find_all('li'):
+                a_tag = item.find('a')
+                span_tag = item.find('span')
+                if not a_tag:
+                    continue
+                title = a_tag.get_text(strip=True)
+                link = a_tag.get('href')
+                if not title or not link:
+                    continue
+                if link.startswith('/'):
+                    link = "https://gaj.bozhou.gov.cn" + link
+                date = span_tag.get_text(strip=True) if span_tag else ""
+                unique_id = hashlib.md5(f"{title}{link}".encode()).hexdigest()
+                articles.append({
+                    "id": unique_id,
+                    "title": title,
+                    "link": link,
+                    "date": date
+                })
+            print(f"第{page_num}页抓到 {len(articles)} 条公告")
+            return articles
+
         except Exception as e:
-            print(f"等待 ul 超时，页面内容片段：{page.content()[:500]}")
-            return []
+            print(f"抓取过程中出现异常: {e}")
+            if attempt < MAX_RETRIES:
+                print(f"等待 {RETRY_DELAY} 秒后重试...")
+                time.sleep(RETRY_DELAY)
+            else:
+                print("已达到最大重试次数，放弃抓取")
+                return []
 
-        html = page.content()
-        browser.close()
-
-    soup = BeautifulSoup(html, 'html.parser')
-    ul = soup.find('ul')
-    if not ul:
-        print(f"第{page_num}页未找到 ul 列表容器")
-        return []
-
-    articles = []
-    for item in ul.find_all('li'):
-        a_tag = item.find('a')
-        span_tag = item.find('span')
-        if not a_tag:
-            continue
-        title = a_tag.get_text(strip=True)
-        link = a_tag.get('href')
-        if not title or not link:
-            continue
-        if link.startswith('/'):
-            link = "https://gaj.bozhou.gov.cn" + link
-        date = span_tag.get_text(strip=True) if span_tag else ""
-        unique_id = hashlib.md5(f"{title}{link}".encode()).hexdigest()
-        articles.append({
-            "id": unique_id,
-            "title": title,
-            "link": link,
-            "date": date
-        })
-    print(f"第{page_num}页抓到 {len(articles)} 条公告")
-    return articles
+    return []
 
 def fetch_all_articles():
     all_articles = []
@@ -120,7 +157,7 @@ def fetch_all_articles():
         page_articles = fetch_articles_from_page(i)
         if page_articles:
             all_articles.extend(page_articles)
-        time.sleep(2)
+        time.sleep(random.uniform(3, 5))  # 随机延迟
     # 去重
     seen = set()
     unique = []
