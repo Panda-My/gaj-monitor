@@ -11,9 +11,11 @@ from datetime import datetime
 import requests
 from bs4 import BeautifulSoup
 
+# ==================== 配置 ====================
 BASE_URL = "https://bz.ahggzp.gov.cn/cms/web/09nje5gp/"
-PAGES = 1                     # 只抓取第一页（最新约10条）
 RECORD_FILE = "record.json"
+MAX_RETRIES = 3
+RETRY_DELAY = 10  # 秒
 
 DINGTALK_WEBHOOK = os.environ.get("DINGTALK_WEBHOOK")
 DINGTALK_SECRET = os.environ.get("DINGTALK_SECRET")
@@ -25,7 +27,10 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "zh-CN,zh;q=0.9",
     "Referer": "https://bz.ahggzp.gov.cn/",
+    "Cache-Control": "no-cache",
+    "Pragma": "no-cache",
 }
+# =============================================
 
 def sign_dingtalk(secret, timestamp):
     string_to_sign = f"{timestamp}\n{secret}"
@@ -55,8 +60,11 @@ def send_dingtalk_message(content):
 
 def load_records():
     if os.path.exists(RECORD_FILE):
-        with open(RECORD_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
+        try:
+            with open(RECORD_FILE, 'r', encoding='utf-8') as f:
+                return json.load(f)
+        except:
+            pass
     return []
 
 def save_records(records):
@@ -65,75 +73,70 @@ def save_records(records):
     with open(RECORD_FILE, 'w', encoding='utf-8') as f:
         json.dump(records, f, ensure_ascii=False, indent=2)
 
-def fetch_articles_from_page(page_num=1):
-    """抓取指定页码的通知公告列表，返回文章列表"""
-    url = BASE_URL
-    if page_num > 1:
-        # 注意分页参数是 pageNo，POST 提交
-        # 但通过 GET 直接访问 URL 不带参数时返回第一页
-        # 如果要获取第二页，需要 POST 表单数据。为简化，我们只抓第一页（最新公告）。
-        # 如果你需要多页，可以扩展使用 POST 请求。
-        print("暂不支持多页抓取，仅抓取第一页")
-        return []
-    
-    print(f"[{datetime.now()}] 正在抓取 {url}")
-    try:
-        # 使用 GET 获取第一页，该网站第一页内容即包含完整列表
-        response = requests.get(url, headers=HEADERS, timeout=30)
-        response.encoding = 'utf-8'
-        if response.status_code != 200:
-            print(f"HTTP {response.status_code} 错误")
-            return []
-        html = response.text
-    except Exception as e:
-        print(f"请求失败: {e}")
-        return []
+def fetch_articles():
+    """带重试的抓取函数"""
+    for attempt in range(1, MAX_RETRIES + 1):
+        print(f"[{datetime.now()}] 尝试 {attempt}/{MAX_RETRIES} 抓取 {BASE_URL}")
+        try:
+            response = requests.get(BASE_URL, headers=HEADERS, timeout=30)
+            response.encoding = 'utf-8'
+            if response.status_code != 200:
+                print(f"HTTP {response.status_code} 错误")
+                continue
+            html = response.text
+            # 快速检查页面是否包含公告列表
+            if "cms_article_list" not in html:
+                print("页面中未找到列表容器，可能是反爬")
+                continue
 
-    # 检查是否包含列表容器
-    if "cms_article_list" not in html:
-        print("页面中未找到列表容器")
-        return []
+            soup = BeautifulSoup(html, 'html.parser')
+            # 定位公告列表区域
+            container = soup.select_one('#cms_article_list')
+            if not container:
+                print("未找到 #cms_article_list")
+                continue
 
-    soup = BeautifulSoup(html, 'html.parser')
-    container = soup.find('div', id='cms_article_list')
-    if not container:
-        print("未找到 id=cms_article_list 的容器")
-        return []
+            articles = []
+            # 每条公告在 <div class="zx"> 中
+            for item in container.find_all('div', class_='zx'):
+                a_tag = item.find('a', class_='zxtitle')
+                date_tag = item.find('div', class_='dateinfo')
+                if not a_tag:
+                    continue
+                title = a_tag.get_text(strip=True)
+                link = a_tag.get('href')
+                if not title or not link:
+                    continue
+                # 处理相对链接
+                if link.startswith('/'):
+                    link = "https://bz.ahggzp.gov.cn" + link
+                date = date_tag.get_text(strip=True) if date_tag else ""
+                unique_id = hashlib.md5(f"{title}{link}".encode()).hexdigest()
+                articles.append({
+                    "id": unique_id,
+                    "title": title,
+                    "link": link,
+                    "date": date
+                })
+            print(f"抓到 {len(articles)} 条公告")
+            return articles
 
-    articles = []
-    for item in container.find_all('div', class_='zx'):
-        a_tag = item.find('a', class_='zxtitle')
-        if not a_tag:
-            continue
-        title = a_tag.get_text(strip=True)
-        link = a_tag.get('href')
-        if not title or not link:
-            continue
-        # 处理相对链接
-        if link.startswith('/'):
-            link = "https://bz.ahggzp.gov.cn" + link
-        date_div = item.find('div', class_='dateinfo')
-        date = date_div.get_text(strip=True) if date_div else ""
-        unique_id = hashlib.md5(f"{title}{link}".encode()).hexdigest()
-        articles.append({
-            "id": unique_id,
-            "title": title,
-            "link": link,
-            "date": date
-        })
-    print(f"抓取到 {len(articles)} 条公告")
-    return articles
+        except requests.exceptions.Timeout:
+            print(f"连接超时，{RETRY_DELAY}秒后重试...")
+            time.sleep(RETRY_DELAY)
+        except Exception as e:
+            print(f"抓取过程中出现异常: {e}")
+            time.sleep(RETRY_DELAY)
 
-def fetch_all_articles():
-    """目前只抓第一页，如需多页可扩展"""
-    return fetch_articles_from_page(1)
+    print("已达到最大重试次数，放弃抓取")
+    return []
 
 def main():
     print(f"[{datetime.now()}] 开始监控（亳州公共招聘网通知公告）")
     existing = load_records()
     existing_ids = {r['id'] for r in existing}
 
-    articles = fetch_all_articles()
+    articles = fetch_articles()
     if not articles:
         print("未抓取到任何文章，请检查网络或网页结构")
         return
